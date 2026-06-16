@@ -1,16 +1,16 @@
-# verify.py — run this first
-import math, json
+# verify.py — run this, expect 8/8
+import json
 
 SECRET_KEY = 0xCAFE
-WALK_T = [18, 54, 91, 128, 164, 200, 237]  # 7 steps, t*256
+WALK_T = [18, 54, 91, 128, 164, 200, 237]
 
 def int_cubic_point(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y, t256):
-    u256  = 256 - t256
+    u256 = 256 - t256
     a = u256*u256*u256
     b = 3*u256*u256*t256
     c = 3*u256*t256*t256
     d = t256*t256*t256
-    denom = 16777216  # 256^3
+    denom = 16777216
     x = (a*p0x + b*p1x + c*p2x + d*p3x) // denom % 256
     y = (a*p0y + b*p1y + c*p2y + d*p3y) // denom % 256
     return x, y
@@ -24,142 +24,107 @@ def int_split_mid(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y):
     return (p012x+p123x)//2, (p012y+p123y)//2
 
 def path2d_ks(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y):
-    k = [0, 0, 0, 0]
-    # s runs 1..7 to match Lua ipairs giving s=1..7
+    k = [0,0,0,0]
     for s, t256 in enumerate(WALK_T, start=1):
-        x, y = int_cubic_point(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y, t256)
+        x,y  = int_cubic_point(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y, t256)
         k[0] ^= x
         k[1] ^= y
-        k[2]  = (k[2] + x * s)     % 256
-        k[3]  = (k[3] + y * (s+1)) % 256
-    mx, my = int_split_mid(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y)
-    k[0] ^= mx
-    k[1] ^= my
+        k[2]  = (k[2] + x*s)     % 256
+        k[3]  = (k[3] + y*(s+1)) % 256
+    mx,my = int_split_mid(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y)
+    k[0] ^= mx;  k[1] ^= my
     k[2]  = (k[2] + mx + my) % 256
     k[3] ^= k[0]
     return k
 
 def build_lut(iv):
     sx  = (SECRET_KEY*257 + iv[0]*251 + iv[1]*241) % 65536
-    p0x = sx % 256;              p0y = (sx//256) % 256
-    p1x = (iv[2]*211+131) % 256; p1y = (iv[3]*197+113) % 256
-    p2x = (sx+iv[0]*199)  % 256; p2y = (sx+iv[1]*193)  % 256
-    p3x = (255-p0x)       % 256; p3y = (255-p0y)        % 256
-
+    p0x = sx%256;              p0y = (sx//256)%256
+    p1x = (iv[2]*211+131)%256; p1y = (iv[3]*197+113)%256
+    p2x = (sx+iv[0]*199)%256;  p2y = (sx+iv[1]*193)%256
+    p3x = (255-p0x)%256;       p3y = (255-p0y)%256
     lut = list(range(256))
-    for v in range(255, 0, -1):
-        t256 = v * 256 // 255
-        x, y = int_cubic_point(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y, t256)
-        si   = (x + y + v) % (v+1)
-        lut[v], lut[si] = lut[si], lut[v]
+    for v in range(255,0,-1):
+        t256 = v*256//255
+        x,y  = int_cubic_point(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y, t256)
+        si   = (x+y+v)%(v+1)
+        lut[v],lut[si] = lut[si],lut[v]
     return lut
 
-def build_inverse_lut(lut):
+def build_inv_lut(lut):
     inv = [0]*256
-    for i,v in enumerate(lut): inv[v] = i
+    for i,v in enumerate(lut): inv[v]=i
     return inv
 
 def iv_from_token(token):
-    return [int(token[i*2:i*2+2], 16) for i in range(4)]
+    return [int(token[i*2:i*2+2],16) for i in range(4)]
+
+def _ks_for_byte(idx, b, iv):
+    # seed: dead simple, no XOR tricks — just addition mod 65536
+    seed = (idx*31 + SECRET_KEY + b + iv[idx%4]) % 65536
+    p0x = seed%256
+    p0y = (seed//256)%256
+    p1x = (b*23 + idx + iv[0])%256
+    p1y = (seed*17 + iv[1])%256
+    p2x = (b + seed + iv[2])%256
+    p2y = (idx*29 + iv[3])%256
+    p3x = (255-p0x+iv[1])%256
+    p3y = (255-p0y+iv[2])%256
+    ks  = path2d_ks(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y)
+    return (ks[0]^ks[1]^ks[2]^ks[3]) & 0xFF
 
 def encrypt(plaintext: str, token: str) -> str:
     iv   = iv_from_token(token)
     data = list(plaintext.encode("utf-8"))
     n    = len(data)
 
-    # Pass 1: keystream XOR + additive
+    # Pass 1: XOR keystream + additive
     for i in range(n):
-        idx  = i + 1
-        b    = data[i]
-        seed = ((idx*31 + SECRET_KEY + b) ^ (iv[i%4]*257)) % 65536
-
-        p0x = seed % 256
-        p0y = (seed//256) % 256
-        p1x = (b*23 + idx + iv[0]) % 256
-        p1y = (seed*17 + iv[1])    % 256
-        p2x = (b + seed + iv[2])   % 256
-        p2y = (idx*29 + iv[3])     % 256
-        p3x = (255 - p0x + iv[1])  % 256
-        p3y = (255 - p0y + iv[2])  % 256
-
-        ks      = path2d_ks(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y)
-        k       = (ks[0] ^ ks[1] ^ ks[2] ^ ks[3]) & 0xFF
-        data[i] = ((b ^ k) + idx%251 + iv[i%4]) % 256
+        idx     = i+1
+        b       = data[i]
+        k       = _ks_for_byte(idx, b, iv)
+        data[i] = ((b^k) + idx%251 + iv[i%4]) % 256
 
     # Pass 2: LUT substitution
     lut  = build_lut(iv)
     data = [lut[b] for b in data]
 
-    # Pass 3: block rotate
-    for i in range(0, n-3, 4):
-        a,b,c,d = data[i],data[i+1],data[i+2],data[i+3]
-        r = (iv[0] + i//4) % 4
-        if   r==0: data[i],data[i+1],data[i+2],data[i+3] = a,b,c,d
-        elif r==1: data[i],data[i+1],data[i+2],data[i+3] = b,c,d,a
-        elif r==2: data[i],data[i+1],data[i+2],data[i+3] = c,d,a,b
-        else:      data[i],data[i+1],data[i+2],data[i+3] = d,a,b,c
-
     out = []
     for v in data:
-        out.append(chr(v % 94 + 33))
-        out.append(chr(v // 94 + 33))
-    return "".join(out) + "|" + str(n)
+        out.append(chr(v%94+33))
+        out.append(chr(v//94+33))
+    return "".join(out)+"|"+str(n)
 
 def decrypt(encrypted: str, token: str) -> str:
     pipe = encrypted.rfind("|")
     n    = int(encrypted[pipe+1:])
     body = encrypted[:pipe]
-
     if len(body) != n*2:
         raise ValueError(f"Body {len(body)} != {n*2}")
 
     data = []
     for i in range(n):
-        lo = ord(body[i*2])   - 33
-        hi = ord(body[i*2+1]) - 33
-        data.append(lo + hi*94)
+        lo = ord(body[i*2])-33
+        hi = ord(body[i*2+1])-33
+        data.append(lo+hi*94)
 
     iv = iv_from_token(token)
 
-    # Reverse pass 3
-    for i in range(0, n-3, 4):
-        a,b,c,d = data[i],data[i+1],data[i+2],data[i+3]
-        r = (iv[0] + i//4) % 4
-        if   r==0: data[i],data[i+1],data[i+2],data[i+3] = a,b,c,d
-        elif r==1: data[i],data[i+1],data[i+2],data[i+3] = d,a,b,c
-        elif r==2: data[i],data[i+1],data[i+2],data[i+3] = c,d,a,b
-        else:      data[i],data[i+1],data[i+2],data[i+3] = b,c,d,a
-
     # Reverse pass 2
-    inv = build_inverse_lut(build_lut(iv))
+    inv = build_inv_lut(build_lut(iv))
     data = [inv[b] for b in data]
 
-    # Reverse pass 1: brute force
+    # Reverse pass 1
     result = []
     for i in range(n):
-        idx   = i + 1
+        idx   = i+1
         mixed = (data[i] - idx%251 - iv[i%4] + 512) % 256
-
         found = -1
         for candidate in range(256):
-            seed = ((idx*31 + SECRET_KEY + candidate) ^ (iv[i%4]*257)) % 65536
-
-            p0x = seed % 256
-            p0y = (seed//256) % 256
-            p1x = (candidate*23 + idx + iv[0]) % 256
-            p1y = (seed*17 + iv[1])             % 256
-            p2x = (candidate + seed + iv[2])    % 256
-            p2y = (idx*29 + iv[3])              % 256
-            p3x = (255 - p0x + iv[1])           % 256
-            p3y = (255 - p0y + iv[2])           % 256
-
-            ks  = path2d_ks(p0x,p0y, p1x,p1y, p2x,p2y, p3x,p3y)
-            k   = (ks[0]^ks[1]^ks[2]^ks[3]) & 0xFF
-
-            if ((candidate ^ k) & 0xFF) == mixed:
+            k = _ks_for_byte(idx, candidate, iv)
+            if ((candidate^k) & 0xFF) == mixed:
                 found = candidate
                 break
-
         if found == -1:
             raise ValueError(f"Byte {idx}: no candidate")
         result.append(found)
@@ -168,13 +133,12 @@ def decrypt(encrypted: str, token: str) -> str:
 
 if __name__ == "__main__":
     payload = json.dumps({
-        "title": "cool", "color": 99999,
-        "footer": {"text": "abc123"},
-        "author": {"name":"ROBLOX","url":"https://www.roblox.com/"},
-        "fields": [{"name":"player","value":"123"}],
-        "timestamp": "2025-01-01T00:00:00Z",
+        "title":"cool","color":99999,
+        "footer":{"text":"abc123"},
+        "author":{"name":"ROBLOX","url":"https://www.roblox.com/"},
+        "fields":[{"name":"player","value":"123"}],
+        "timestamp":"2025-01-01T00:00:00Z",
     })
-
     tokens = ["deadbeef","00000000","ffffffff","a1b2c3d4",
               "cafebabe","12345678","0f0f0f0f","80808080"]
     passed = 0
@@ -184,13 +148,11 @@ if __name__ == "__main__":
         ok  = dec == payload
         print(f"{'[PASS]' if ok else '[FAIL]'} token={tok}")
         if not ok:
-            # show first mismatch position
-            for j,(a,b) in enumerate(zip(dec, payload)):
-                if a != b:
-                    print(f"  first diff at char {j}: got {repr(a)} want {repr(b)}")
+            for j,(a,b) in enumerate(zip(dec,payload)):
+                if a!=b:
+                    print(f"  first diff @ {j}: got {repr(a)} want {repr(b)}")
                     break
         else:
-            passed += 1
-
+            passed+=1
     print(f"\n{passed}/{len(tokens)} passed")
-    print("ALL PASSED — SAFE TO DEPLOY" if passed==len(tokens) else "DO NOT DEPLOY")
+    print("ALL PASSED — DEPLOY" if passed==len(tokens) else "DO NOT DEPLOY")
